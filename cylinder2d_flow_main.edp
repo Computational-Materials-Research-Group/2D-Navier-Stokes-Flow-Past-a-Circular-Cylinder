@@ -1,0 +1,230 @@
+// ============================================================
+// 2D Navier-Stokes - Circular Cylinder - AMR - PVD Output
+// FreeFEM++ - characteristics method (convect)
+// ============================================================
+
+load "iovtk"
+
+string outdir = "C:\\Users\\pedit\\Downloads\\cylinder2d\\";
+system("mkdir \"C:\\Users\\pedit\\Downloads\\cylinder2d\"");
+
+// ============================================================
+// PARAMETERS
+// ============================================================
+real Rho     = 1.0;
+real Mu      = 0.002;
+real Uinf    = 1.0;
+real dynPres = 0.5 * Rho * Uinf * Uinf;
+
+real Rcyl    = 0.5;
+real Lx1     = 5.0;
+real Lx2     = 20.0;
+real Ly      = 8.0;
+
+real dt       = 0.02;
+int  Nsteps   = 2000;
+int  adaptFreq = 20;
+int  saveFreq  = 10;
+real errAMR   = 0.02;
+real hminAMR  = 0.01;
+real hmaxAMR  = 2.0;
+int  nbvxMax  = 80000;
+
+real Re = Rho * Uinf * 2.*Rcyl / Mu;
+cout << "Re=" << Re << "  Mu=" << Mu
+     << "  dt=" << dt << "  Nsteps=" << Nsteps << endl;
+
+// ============================================================
+// MESH
+// Outer rectangle: COUNTER-CLOCKWISE (positive points)
+//   start bottom-left, go right along bottom,
+//   up along right side, left along top, down along left side
+// Cylinder hole: CLOCKWISE = negative point count
+// Labels: 1=inlet  2=outlet  3=top/bottom walls  4=cylinder
+// ============================================================
+border Bottom(t=-Lx1, Lx2 ){ x=t;    y=-Ly;  label=3; }  // left->right along bottom
+border Right (t=-Ly,  Ly  ){ x= Lx2; y=t;    label=2; }  // bottom->top along outlet
+border Top   (t= Lx2,-Lx1 ){ x=t;    y= Ly;  label=3; }  // right->left along top
+border Left  (t= Ly, -Ly  ){ x=-Lx1; y=t;    label=1; }  // top->bottom along inlet
+border Cyl   (t=0,  2*pi  ){ x=Rcyl*cos(t); y=Rcyl*sin(t); label=4; }
+
+mesh Th = buildmesh(
+    Bottom(60) + Right(20) + Top(60) + Left(20) + Cyl(-60)
+);
+cout << "Initial mesh: nv=" << Th.nv << "  nt=" << Th.nt << endl;
+
+// ============================================================
+// FE SPACES
+// ============================================================
+fespace Uh(Th, [P2, P2]);
+fespace Ph(Th, P1);
+fespace Sh(Th, P1);
+
+Uh [ux,  uy ];
+Uh [upx, upy];
+Uh [vx,  vy ];
+Ph p, q;
+Sh omega, omegaMag, velMag, Cp, cellSize, skinFric;
+
+// ============================================================
+// INITIAL CONDITION  (vector = vector: always valid)
+// ============================================================
+[upx, upy] = [Uinf, 0.];
+[ux,  uy ] = [Uinf, 0.];
+p = 0.;
+cout << "IC: ux_max=" << ux[].max << endl;
+
+// ============================================================
+// PVD HEADER
+// ============================================================
+{
+    ofstream pvd(outdir + "cylinder2d.pvd");
+    pvd << "<?xml version='1.0'?>"                    << endl;
+    pvd << "<VTKFile type='Collection' version='0.1'" << endl;
+    pvd << "         byte_order='LittleEndian'>"       << endl;
+    pvd << "  <Collection>"                            << endl;
+}
+
+int frameCount = 0;
+
+// ============================================================
+// TIME LOOP
+// ============================================================
+for (int step = 0; step < Nsteps; step++) {
+
+    real tphys = (step + 1) * dt;
+
+    // ----------------------------------------------------------
+    // SOLVE: characteristics method
+    // ----------------------------------------------------------
+    solve NavierStokes(
+        [ux,  uy,  p ],
+        [vx,  vy,  q ],
+        solver = UMFPACK
+    ) =
+
+        int2d(Th)(
+            (Rho/dt) * [ux, uy]' * [vx, vy]
+        )
+
+        + int2d(Th)(
+            Mu * (
+                dx(ux)*dx(vx) + dy(ux)*dy(vx)
+              + dx(uy)*dx(vy) + dy(uy)*dy(vy)
+            )
+        )
+
+        - int2d(Th)(
+            p * (dx(vx) + dy(vy))
+        )
+
+        - int2d(Th)(
+            (dx(ux) + dy(uy)) * q
+        )
+
+        - int2d(Th)(
+            (Rho/dt) * [convect([upx,upy],-dt,upx),
+                        convect([upx,upy],-dt,upy)]' * [vx,vy]
+        )
+
+        + on(1, ux=Uinf, uy=0.)
+        + on(3, ux=Uinf, uy=0.)
+        + on(4, ux=0.,   uy=0.)
+    ;
+
+    // UPDATE
+    [upx, upy] = [ux, uy];
+
+    // DERIVED FIELDS
+    omega    = dx(uy) - dy(ux);
+    omegaMag = abs(dx(uy) - dy(ux));
+    velMag   = sqrt(ux*ux + uy*uy);
+    Cp       = p / dynPres;
+    cellSize = hTriangle;
+    skinFric = Mu * sqrt(
+                   2.*dx(ux)*dx(ux)
+                 + 2.*dy(uy)*dy(uy)
+                 + (dy(ux)+dx(uy))*(dy(ux)+dx(uy))
+               ) / dynPres;
+
+    // CONSOLE
+    cout << "Step " << step+1 << "/" << Nsteps
+         << "  t="       << tphys
+         << "  nv="      << Th.nv
+         << "  ux_max="  << ux[].max
+         << "  ux_min="  << ux[].min
+         << "  |om|_max="<< omegaMag[].max
+         << "  Cp_max="  << Cp[].max
+         << endl;
+
+    // SAVE VTU
+    if (step % saveFreq == 0) {
+
+        string num;
+        if      (frameCount <   10) num = "000" + frameCount;
+        else if (frameCount <  100) num = "00"  + frameCount;
+        else if (frameCount < 1000) num = "0"   + frameCount;
+        else                        num = ""    + frameCount;
+
+        int[int] ord = [1,1,1,1,1,1,1,1];
+
+        savevtk(outdir+"frame"+num+".vtu", Th,
+                ux, uy, velMag,
+                p, Cp,
+                omega, omegaMag,
+                cellSize,
+                dataname = "Ux Uy VelMag Pressure Cp Vorticity VorticityMag CellSize",
+                order    = ord
+        );
+
+        {
+            ofstream pvd(outdir + "cylinder2d.pvd", append);
+            pvd << "    <DataSet timestep='" << tphys
+                << "' group='' part='0'"
+                << " file='frame" << num << ".vtu'/>" << endl;
+        }
+
+        frameCount++;
+        cout << "  -> frame" << num << ".vtu saved" << endl;
+    }
+
+    // AMR
+    if (step % adaptFreq == 0 && step > 0) {
+
+        Th = adaptmesh(Th,
+                       [omega, ux, uy],
+                       nbvx  = nbvxMax,
+                       err   = errAMR,
+                       hmin  = hminAMR,
+                       hmax  = hmaxAMR,
+                       ratio = 1.8,
+                       iso   = 1
+             );
+
+        [ux,  uy ] = [ux,  uy ];
+        [upx, upy] = [upx, upy];
+        p          = p;
+
+        cout << "  -> AMR: nv=" << Th.nv
+             << "  nt=" << Th.nt << endl;
+    }
+
+} // end time loop
+
+// CLOSE PVD
+{
+    ofstream pvd(outdir + "cylinder2d.pvd", append);
+    pvd << "  </Collection>" << endl;
+    pvd << "</VTKFile>"      << endl;
+}
+
+cout << "==========================================" << endl;
+cout << " Done. Open cylinder2d.pvd in ParaView"     << endl;
+cout << "==========================================" << endl;
+cout << " ParaView 4-panel guide:"                   << endl;
+cout << "  TOP LEFT    -> Representation: Wireframe" << endl;
+cout << "  TOP RIGHT   -> field: CellSize"           << endl;
+cout << "  BOTTOM LEFT -> field: VorticityMag"       << endl;
+cout << "  BOTTOM RIGHT-> field: Ux (Cool-Warm)"     << endl;
+cout << "                + surface Cp on cylinder"   << endl;
+cout << "==========================================" << endl;
